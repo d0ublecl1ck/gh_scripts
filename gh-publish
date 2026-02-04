@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Create a new GitHub repository from the current directory and publish it.
+
+Usage:
+  gh-publish [--name <repo>] [--public|--private] [--remote <name>] [--yes]
+  gh-publish --ob [--remote <name>]
+  gh-publish --op [--remote <name>]
+
+Examples:
+  gh-publish
+  gh-publish --name my-repo --private --yes
+  gh-publish --ob
+  gh-publish --op --remote upstream
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+repo_name=""
+visibility=""
+remote_name="origin"
+assume_yes="0"
+use_dir_name="0"
+preset=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -n|--name)
+      [[ $# -ge 2 ]] || die "--name requires a value"
+      [[ -z "${preset}" ]] || die "Cannot use --name with --ob/--op"
+      repo_name="$2"
+      shift 2
+      ;;
+    --public)
+      [[ -z "${preset}" ]] || die "Cannot use --public with --ob/--op"
+      visibility="public"
+      shift
+      ;;
+    --private)
+      [[ -z "${preset}" ]] || die "Cannot use --private with --ob/--op"
+      visibility="private"
+      shift
+      ;;
+    --ob)
+      if [[ -n "${preset}" ]]; then
+        [[ "${preset}" != "ob" ]] || die "Duplicate --ob"
+        die "Cannot use --ob with --op"
+      fi
+      [[ -z "${repo_name}" ]] || die "Cannot use --ob with --name"
+      [[ -z "${visibility}" ]] || die "Cannot use --ob with --public/--private"
+      preset="ob"
+      use_dir_name="1"
+      visibility="public"
+      assume_yes="1"
+      shift
+      ;;
+    --op)
+      if [[ -n "${preset}" ]]; then
+        [[ "${preset}" != "op" ]] || die "Duplicate --op"
+        die "Cannot use --op with --ob"
+      fi
+      [[ -z "${repo_name}" ]] || die "Cannot use --op with --name"
+      [[ -z "${visibility}" ]] || die "Cannot use --op with --public/--private"
+      preset="op"
+      use_dir_name="1"
+      visibility="private"
+      assume_yes="1"
+      shift
+      ;;
+    -r|--remote)
+      [[ $# -ge 2 ]] || die "--remote requires a value"
+      remote_name="$2"
+      shift 2
+      ;;
+    -y|--yes)
+      assume_yes="1"
+      shift
+      ;;
+    *)
+      die "Unknown argument: $1 (use --help)"
+      ;;
+  esac
+done
+
+need_cmd git
+need_cmd gh
+
+default_repo_name="$(basename "$(pwd)")"
+
+if [[ -z "${repo_name}" ]]; then
+  if [[ "${use_dir_name}" == "1" ]]; then
+    repo_name="${default_repo_name}"
+  else
+    read -r -p "Repository name [${default_repo_name}]: " repo_name || true
+    repo_name="${repo_name:-$default_repo_name}"
+  fi
+fi
+
+if [[ -z "${visibility}" ]]; then
+  info "Visibility:"
+  info "  1) private (default)"
+  info "  2) public"
+  read -r -p "Choose [1/2]: " vis_choice || true
+  case "${vis_choice:-1}" in
+    1|private|PRIVATE|Private)
+      visibility="private"
+      ;;
+    2|public|PUBLIC|Public)
+      visibility="public"
+      ;;
+    *)
+      die "Invalid choice: ${vis_choice}"
+      ;;
+  esac
+fi
+
+case "${visibility}" in
+  public|private) ;;
+  *) die "Invalid visibility: ${visibility} (must be public/private)" ;;
+esac
+
+if [[ -z "${repo_name}" ]]; then
+  die "Repository name cannot be empty"
+fi
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  :
+else
+  info "Initializing git repository..."
+  if git init -b main >/dev/null 2>&1; then
+    :
+  else
+    git init >/dev/null
+    git checkout -b main >/dev/null 2>&1 || true
+  fi
+fi
+
+if git remote get-url "${remote_name}" >/dev/null 2>&1; then
+  die "Remote '${remote_name}' already exists. Pick a different name via --remote, or remove/rename the existing remote."
+fi
+
+if ! gh auth status --active >/dev/null 2>&1; then
+  info "GitHub CLI is not authenticated. Starting login..."
+  gh auth login -w -p https -s repo
+fi
+
+has_commit="0"
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  has_commit="1"
+fi
+
+if [[ "${has_commit}" != "1" ]]; then
+  if ! find . -mindepth 1 -maxdepth 1 ! -name .git -print -quit 2>/dev/null | grep -q .; then
+    info "Directory is empty; creating README.md for the initial commit..."
+    printf '# %s\n' "${repo_name}" > README.md
+  fi
+
+  git add -A
+  if git diff --cached --quiet; then
+    die "Nothing to commit. Add at least one file, then re-run."
+  fi
+
+  info "Creating initial commit..."
+  git commit -m "Initial commit" >/dev/null
+fi
+
+if [[ "${assume_yes}" != "1" ]]; then
+  info ""
+  info "About to create GitHub repo '${repo_name}' (${visibility}) and push this directory."
+  read -r -p "Press Enter to continue (Ctrl-C to cancel): " _ || true
+fi
+
+info "Creating GitHub repository and pushing..."
+gh repo create "${repo_name}" "--${visibility}" --source=. --remote="${remote_name}" --push
+
+info "Done."
