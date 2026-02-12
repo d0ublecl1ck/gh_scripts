@@ -31,6 +31,18 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+resolve_repo_full_name() {
+  local owner
+  if [[ "${repo_name}" == */* ]]; then
+    printf '%s\n' "${repo_name}"
+    return
+  fi
+
+  owner="$(gh api user -q .login 2>/dev/null || true)"
+  [[ -n "${owner}" ]] || die "Failed to determine GitHub username. Please pass --name owner/repo."
+  printf '%s/%s\n' "${owner}" "${repo_name}"
+}
+
 repo_name=""
 visibility=""
 remote_name="origin"
@@ -142,9 +154,11 @@ if [[ -z "${repo_name}" ]]; then
   die "Repository name cannot be empty"
 fi
 
+is_existing_repo="1"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   :
 else
+  is_existing_repo="0"
   info "Initializing git repository..."
   if git init -b main >/dev/null 2>&1; then
     :
@@ -189,7 +203,53 @@ if [[ "${assume_yes}" != "1" ]]; then
   read -r -p "Press Enter to continue (Ctrl-C to cancel): " _ || true
 fi
 
-info "Creating GitHub repository and pushing..."
-gh repo create "${repo_name}" "--${visibility}" --source=. --remote="${remote_name}" --push
+if [[ "${is_existing_repo}" == "1" ]]; then
+  current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  push_ref="${current_branch:-HEAD}"
+
+  info "Creating GitHub repository..."
+  create_err=""
+  if create_err="$(gh repo create "${repo_name}" "--${visibility}" --source=. --remote="${remote_name}" 2>&1)"; then
+    :
+  else
+    if printf '%s' "${create_err}" | grep -Fq "Name already exists on this account"; then
+      info "${create_err}"
+      info ""
+      info "Repository '${repo_name}' already exists on GitHub."
+      info "  1) Cancel (default)"
+      info "  2) Bind existing repo and push"
+      info "  3) Delete remote repo and recreate"
+      read -r -p "Choose [1/2/3]: " exists_choice || true
+      case "${exists_choice:-1}" in
+        1)
+          die "Canceled by user."
+          ;;
+        2)
+          full_repo_name="$(resolve_repo_full_name)"
+          info "Binding remote '${remote_name}' -> https://github.com/${full_repo_name}.git"
+          git remote add "${remote_name}" "https://github.com/${full_repo_name}.git"
+          ;;
+        3)
+          full_repo_name="$(resolve_repo_full_name)"
+          info "Deleting remote repository '${full_repo_name}'..."
+          gh repo delete "${full_repo_name}" --yes
+          info "Recreating GitHub repository..."
+          gh repo create "${repo_name}" "--${visibility}" --source=. --remote="${remote_name}"
+          ;;
+        *)
+          die "Invalid choice: ${exists_choice}"
+          ;;
+      esac
+    else
+      printf '%s\n' "${create_err}" >&2
+      exit 1
+    fi
+  fi
+  info "Pushing ref '${push_ref}'..."
+  git push -u "${remote_name}" "${push_ref}"
+else
+  info "Creating GitHub repository and pushing..."
+  gh repo create "${repo_name}" "--${visibility}" --source=. --remote="${remote_name}" --push
+fi
 
 info "Done."
